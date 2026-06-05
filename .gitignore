@@ -1,0 +1,53 @@
+# ---- secrets ----
+.env
+*.env
+!.env.example
+docker/.env
+**/airflow.cfg
+**/webserver_config.py
+
+# ---- jupyter (contains passwords + output cells) ----
+jupyter/
+**/.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- virtual environments ----
+venv/
+.venv/
+**/venv/
+**/.venv/
+env/
+
+# ---- mlflow (large, regenerable; data lives in postgres + artifacts) ----
+mlflow/artifacts/
+mlruns/
+mlflow.db
+
+# ---- airflow (regenerable runtime state) ----
+airflow/logs/
+airflow/airflow.db
+airflow/*.pid
+
+# ---- node / frontend ----
+node_modules/
+dist/
+build/
+.next/
+
+# ---- os / editor noise ----
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# logs and runtime output
+*.log
+*_log.txt
+nohup.out

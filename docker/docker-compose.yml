@@ -1,0 +1,81 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: octagon-api
+    network_mode: host
+    environment:
+      - MLFLOW_URI=http://localhost:5000
+      - DB_NAME=octagon_analytics
+      - DB_USER=mlops
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=localhost
+      - DB_PORT=5432
+    volumes:
+      - ../mlflow/artifacts:/home/mlops/octagon-analytics/mlflow/artifacts
+    depends_on:
+      - mlflow
+    restart: unless-stopped
+
+  mlflow:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mlflow
+    container_name: octagon-mlflow
+    network_mode: host
+    volumes:
+      - ../mlflow/artifacts:/mlflow/artifacts
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://mlops:${DB_PASSWORD}@localhost:5432/octagon_analytics
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+      --cors-allowed-origins "*"
+    restart: unless-stopped
+
+  airflow-webserver:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
+    container_name: octagon-airflow-webserver
+    command: webserver
+    network_mode: host
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@localhost/airflow_db
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW_HOME=/opt/airflow
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../airflow/logs:/opt/airflow/logs
+      - ../scraper:/home/mlops/octagon-analytics/scraper
+      - ../training:/home/mlops/octagon-analytics/training
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
+    container_name: octagon-airflow-scheduler
+    command: scheduler
+    network_mode: host
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@localhost/airflow_db
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW_HOME=/opt/airflow
+      - DB_NAME=octagon_analytics
+      - DB_USER=mlops
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=localhost
+      - DB_PORT=5432
+      - API_URL=http://localhost:8000
+      - MLFLOW_URI=http://localhost:5000
+    volumes:
+      - ../airflow/dags:/opt/airflow/dags
+      - ../airflow/logs:/opt/airflow/logs
+      - ../scraper:/home/mlops/octagon-analytics/scraper
+      - ../training:/home/mlops/octagon-analytics/training
+    restart: unless-stopped
