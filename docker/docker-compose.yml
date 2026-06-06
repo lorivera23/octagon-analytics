@@ -1,21 +1,36 @@
 services:
+  postgres:
+    image: postgres:14
+    container_name: octagon-postgres
+    environment:
+      - POSTGRES_DB=octagon_analytics
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+  
   api:
     build:
       context: ..
       dockerfile: docker/Dockerfile.api
     container_name: octagon-api
-    network_mode: host
+    ports:
+      - "8000:8000"
     environment:
-      - MLFLOW_URI=http://localhost:5000
+      - MLFLOW_URI=http://mlflow:5000
       - DB_NAME=octagon_analytics
       - DB_USER=mlops
       - DB_PASSWORD=${DB_PASSWORD}
-      - DB_HOST=localhost
+      - DB_HOST=postgres
       - DB_PORT=5432
     volumes:
       - ../mlflow/artifacts:/home/mlops/octagon-analytics/mlflow/artifacts
     depends_on:
       - mlflow
+      - postgres
     restart: unless-stopped
 
   mlflow:
@@ -23,16 +38,20 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.mlflow
     container_name: octagon-mlflow
-    network_mode: host
+    ports:
+      - "5000:5000"
     volumes:
       - ../mlflow/artifacts:/mlflow/artifacts
     command: >
       mlflow server
-      --backend-store-uri postgresql://mlops:${DB_PASSWORD}@localhost:5432/octagon_analytics
+      --backend-store-uri postgresql://mlops:${DB_PASSWORD}@postgres:5432/octagon_analytics
       --default-artifact-root /mlflow/artifacts
       --host 0.0.0.0
       --port 5000
+      --allowed-hosts "mlflow:5000,mlflow,localhost:*,127.0.0.1:*"
       --cors-allowed-origins "*"
+    depends_on:
+      - postgres
     restart: unless-stopped
 
   airflow-webserver:
@@ -40,11 +59,12 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.airflow
     container_name: octagon-airflow-webserver
-    command: webserver
-    network_mode: host
+    command: webserver --port 8080
+    ports:
+      - "8080:8080"
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@localhost/airflow_db
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@postgres/airflow_db
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - AIRFLOW_HOME=/opt/airflow
     volumes:
@@ -52,6 +72,8 @@ services:
       - ../airflow/logs:/opt/airflow/logs
       - ../scraper:/home/mlops/octagon-analytics/scraper
       - ../training:/home/mlops/octagon-analytics/training
+    depends_on:
+      - postgres
     restart: unless-stopped
 
   airflow-scheduler:
@@ -60,22 +82,26 @@ services:
       dockerfile: docker/Dockerfile.airflow
     container_name: octagon-airflow-scheduler
     command: scheduler
-    network_mode: host
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@localhost/airflow_db
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@postgres/airflow_db
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - AIRFLOW_HOME=/opt/airflow
       - DB_NAME=octagon_analytics
       - DB_USER=mlops
       - DB_PASSWORD=${DB_PASSWORD}
-      - DB_HOST=localhost
+      - DB_HOST=postgres
       - DB_PORT=5432
-      - API_URL=http://localhost:8000
-      - MLFLOW_URI=http://localhost:5000
+      - API_URL=http://api:8000
+      - MLFLOW_URI=http://mlflow:5000
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../airflow/logs:/opt/airflow/logs
       - ../scraper:/home/mlops/octagon-analytics/scraper
       - ../training:/home/mlops/octagon-analytics/training
+    depends_on:
+      - postgres
     restart: unless-stopped
+
+volumes:
+  pgdata:
