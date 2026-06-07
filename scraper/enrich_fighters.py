@@ -1,31 +1,22 @@
 import asyncio
+from contextlib import closing
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
-import psycopg2
-import time
-import os
+from db import get_db
 
-# change these to environment variables
-# also this + get_db logic is duplicated from scraper.py, make a shared db.py / config module for both config and get db
-DB_CONFIG = {
-    "dbname": os.environ["DB_NAME"],
-    "user": os.environ["DB_USER"],
-    "password": os.environ["DB_PASSWORD"],
-    "host": os.environ["DB_HOST"]
-}
-
-
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
+EXPECTED_STATS = {"SLPM", "STR. ACC.", "SAPM", "STR. DEF", "TD AVG.",
+                  "TD ACC.", "TD DEF.", "SUB. AVG."}
 
 def parse_fighter_stats(html):
     soup = BeautifulSoup(html, "html.parser")
-    stats = {}
-
-    # this line could quietly fail, which would give an empty list that is never caught, potentially never enriching fighters if this
-    # css selector were to change and even worse, if a stat other than splm is missing it would consider it enriched and we would never
-    # know, add a check to see if this items list ever gets populated
     items = soup.select("li.b-list__box-list-item")
+
+    if not items:
+        raise ValueError(
+            "parse_fighter_stats found 0 list items — page layout or selector changed"
+        )
+
+    stats = {}
     for item in items:
         parts = [p.strip() for p in item.get_text(separator="|").split("|") if p.strip()]
         if len(parts) >= 2:
@@ -34,12 +25,17 @@ def parse_fighter_stats(html):
             if value and value != "--":
                 stats[label] = value
 
-    # Need to add a check here ensuring that our string keys from update_fighter() match whatever we grab
-    # make a list of expected, and raise if there are any missing
+    missing = EXPECTED_STATS - stats.keys()
+    if missing:
+        raise ValueError(
+            f"parse_fighter_stats parsed page but missing expected stats: {sorted(missing)}"
+        )
+
 
     return stats
 
 def update_fighter(conn, fighter_id, stats):
+    # fighter is one atomic unit, leave the commit responsibility to this function
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE fighters SET
@@ -84,36 +80,44 @@ def get_unenriched_fighters(conn):
         return cur.fetchall()
 
 async def main():
-    conn = get_db()
-    fighters = get_unenriched_fighters(conn)
-    print(f"Enriching {len(fighters)} fighters...")
+    with closing(get_db()) as conn:
+        fighters = get_unenriched_fighters(conn)
+        print(f"Enriching {len(fighters)} fighters...")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+       
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            
+            failed = []
+            for i, (fighter_id, name, url) in enumerate(fighters):
+                try:
+                    await page.goto(url, timeout=60000)
+                    await page.wait_for_selector("li.b-list__box-list-item", timeout=15000)
+                    html = await page.content()
 
-        for i, (fighter_id, name, url) in enumerate(fighters):
-            # this try statement would catch any errors raised by parse_fighter_stats (raise checks to be added), making them useless
-            # Add a counter that raises after the loop failure rate is high
-            try:
-                await page.goto(url, timeout=60000)
-                await page.wait_for_selector("li.b-list__box-list-item", timeout=15000)
-                html = await page.content()
+                    stats = parse_fighter_stats(html)
+                    update_fighter(conn, fighter_id, stats)
 
-                stats = parse_fighter_stats(html)
-                update_fighter(conn, fighter_id, stats)
+                    print(f"[{i+1}/{len(fighters)}] {name} → {stats}")
 
-                print(f"[{i+1}/{len(fighters)}] {name} → {stats}")
+                except Exception as e:
+                    conn.rollback()        # clears aborted-transaction state so the loop can continue
+                    failed.append(name)
+                    print(f"[{i+1}/{len(fighters)}] {name} → Error: {e}")
+                
+                await asyncio.sleep(1)
+          
+            await browser.close()
 
-            except Exception as e:
-                print(f"[{i+1}/{len(fighters)}] {name} → Error: {e}")
-
-            await asyncio.sleep(1)
-        # similar lifecycle issue from scraper.py, commits live inside the update function, and we do one open and close, which
-        # could skip erros
-        await browser.close()
-
-    conn.close()
+        if fighters and len(failed) == len(fighters):
+            raise RuntimeError(
+                f"All {len(fighters)} fighters failed to enrich — systemic failure. "
+                f"Examples: {failed[:3]}"
+            )
+        if failed:
+            print(f"WARNING: {len(failed)}/{len(fighters)} fighters failed: {failed}")
+  
     print("Done.")
 
 if __name__ == "__main__":

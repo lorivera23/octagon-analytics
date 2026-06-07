@@ -1,24 +1,16 @@
 import asyncio
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
-import psycopg2
-import requests
+from db import get_db
 import json
 import os
 
-# same problem with environment variables + duplicated  db_config and get_db()
-DB_CONFIG = {
-    "dbname": os.environ["DB_NAME"],
-    "user": os.environ["DB_USER"],
-    "password": os.environ["DB_PASSWORD"],
-    "host": os.environ["DB_HOST"]
-}
+
 
 BASE_URL = "http://ufcstats.com"
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
+
 
 def extract_id(url):
     return url.rstrip("/").split("/")[-1]
