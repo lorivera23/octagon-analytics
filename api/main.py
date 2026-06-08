@@ -125,7 +125,7 @@ def build_features(f1: dict, f2: dict) -> pd.DataFrame:
     return pd.DataFrame([features])
 
 def log_prediction(f1: dict, f2: dict, f1_prob: float, f2_prob: float, 
-                   event_id: str = None, weight_class: str = None):
+                   event_id: str = None, weight_class: str = None, fight_id: str = None):
     import mlflow
     from mlflow.tracking import MlflowClient
     
@@ -147,13 +147,14 @@ def log_prediction(f1: dict, f2: dict, f1_prob: float, f2_prob: float,
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO predictions (
-                event_id, fighter_1_id, fighter_2_id,
+                fight_id, event_id, fighter_1_id, fighter_2_id,
                 fighter_1_name, fighter_2_name,
                 fighter_1_win_prob, fighter_2_win_prob,
                 predicted_winner_id, model_version, model_auc,
                 weight_class, is_upcoming
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
+            fight_id,
             event_id,
             f1['fighter_id'],
             f2['fighter_id'],
@@ -177,6 +178,7 @@ class PredictionRequest(BaseModel):
     fighter_2: str
     weight_class: str = None
     event_id: str = None
+    fight_id: str = None
 
 class PredictionResponse(BaseModel):
     fighter_1: str
@@ -217,11 +219,13 @@ def predict(request: PredictionRequest):
     confidence = "high" if abs(f1_prob - 0.5) > 0.15 else "medium" if abs(f1_prob - 0.5) > 0.05 else "low"
     
     try:
-        log_prediction(
-            f1, f2, f1_prob, f2_prob,
-            event_id=request.event_id if hasattr(request, 'event_id') else None,
-            weight_class=request.weight_class
-        )
+        if request.fight_id:
+            log_prediction(
+                f1, f2, f1_prob, f2_prob,
+                event_id=request.event_id,
+                weight_class=request.weight_class,
+                fight_id=request.fight_id
+            )
     except Exception as e:
         print(f"Warning: failed to log prediction: {e}")
 

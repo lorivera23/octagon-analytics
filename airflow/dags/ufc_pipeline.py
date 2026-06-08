@@ -4,6 +4,10 @@ from datetime import datetime, timedelta
 import pendulum
 import os
 
+# NOTE FOR FIXES: I am putting score_pending_predictions as a standalone file, manage imports as necessary
+#                 I see a lot of dupiclated run logic for the scrapers, see if we cannot just import the run from the script
+#                 If not, then atleast update them to match the scraper fixes. 
+
 MLFLOW_URI = os.environ["MLFLOW_URI"]
 
 default_args = {
@@ -26,7 +30,8 @@ with DAG(
         import sys
         sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
         import asyncio
-        from scraper import get_existing_events, get_events, get_db
+        from db import get_db
+        from scraper import get_existing_events, get_events
 
         async def run():
             conn = get_db()
@@ -55,7 +60,8 @@ with DAG(
         import sys
         sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
         import asyncio
-        from scraper import get_db, get_fights, save_event, save_fighter, save_fight
+        from db import get_db
+        from scraper import get_fights, save_event, save_fighter, save_fight
         from playwright.async_api import async_playwright
 
         async def run():
@@ -92,7 +98,8 @@ with DAG(
         import sys
         sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
         import asyncio
-        from enrich_fighters import get_db, get_unenriched_fighters, parse_fighter_stats, update_fighter
+        from db import get_db
+        from enrich_fighters import get_unenriched_fighters, parse_fighter_stats, update_fighter
         from playwright.async_api import async_playwright
 
         async def run():
@@ -231,17 +238,19 @@ Decision:            {decision}
     def score_pending_predictions(**context):
         import sys
         sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
-        from upcoming import get_db, score_pending_predictions as _score
-        conn = get_db()
-        scored = _score(conn)
-        conn.close()
+        from db import get_db
+        from score_predictions import score_pending_predictions as _score
+        from contextlib import closing
+        with closing(get_db()) as conn:
+            scored = _score(conn)
         context["ti"].xcom_push(key="scored_count", value=scored)
 
     def scrape_upcoming_and_predict(**context):
         import sys
         sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
         import asyncio
-        from upcoming import (get_db, get_existing_predictions,
+        from db import get_db
+        from upcoming import (get_existing_predictions,
                               get_upcoming_events, get_upcoming_fights,
                               save_upcoming_event, predict_and_store)
         from playwright.async_api import async_playwright
