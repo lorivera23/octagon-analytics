@@ -67,6 +67,10 @@ async def get_events(browser):
    
     return events
 
+# current problem - SELECT split_part(method, E'\n', 1) AS m, count(*)
+#                   FROM fights WHERE winner_id IS NULL
+#                   GROUP BY split_part(method, E'\n', 1) ORDER BY count(*) DESC;
+# gives a table of missing winners, there are 38 missing majority decisions, 17 split, 7 unanimous, needs backfill
 async def get_fights(event_url, browser):
     html = await scrape_with_browser(
         event_url,
@@ -212,12 +216,7 @@ async def run_incremental():
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            # using one page for the entire scrape could be problementaic, if we run into one problem/error we could be left with an
-            # unhealthy page state without knowing it, and it would silently fail.
-            # fix is going to be a refractor of who orchestrates pages (getting moved to scrape_with_broswer, check there for further 
-            # changes)
-
-
+           
             all_events = await get_events(browser)
 
             if len(all_events) < len(existing):

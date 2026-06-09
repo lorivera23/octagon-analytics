@@ -138,7 +138,7 @@ def predict_and_store(conn, fight, event_id, existing_predictions):
         print(f"  Error predicting {fight['fighter_1_name']} vs {fight['fighter_2_name']}: {e}")
         return "error"
 
-async def main():
+async def run_upcoming():
     with closing(get_db()) as conn:
 
         print("\n=== Scraping upcoming events ===")
@@ -195,5 +195,4 @@ async def main():
         print("\nDone.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
- 
+    asyncio.run(run_upcoming())

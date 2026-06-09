@@ -79,7 +79,7 @@ def get_unenriched_fighters(conn):
         """)
         return cur.fetchall()
 
-async def main():
+async def run_enrichment():
     with closing(get_db()) as conn:
         fighters = get_unenriched_fighters(conn)
         print(f"Enriching {len(fighters)} fighters...")
@@ -121,4 +121,4 @@ async def main():
     print("Done.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_enrich())

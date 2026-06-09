@@ -72,6 +72,7 @@ services:
       - ../airflow/logs:/opt/airflow/logs
       - ../scraper:/home/mlops/octagon-analytics/scraper
       - ../training:/home/mlops/octagon-analytics/training
+      - ../pipeline_utils:/home/mlops/octagon-analytics/pipeline_utils
     depends_on:
       - postgres
     restart: unless-stopped
@@ -94,11 +95,13 @@ services:
       - DB_PORT=5432
       - API_URL=http://api:8000
       - MLFLOW_URI=http://mlflow:5000
+      - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD}
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../airflow/logs:/opt/airflow/logs
       - ../scraper:/home/mlops/octagon-analytics/scraper
       - ../training:/home/mlops/octagon-analytics/training
+      - ../pipeline_utils:/home/mlops/octagon-analytics/pipeline_utils
     depends_on:
       - postgres
     restart: unless-stopped
