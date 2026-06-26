@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from mlflow.tracking import MlflowClient
 import mlflow
 import mlflow.xgboost
 import pandas as pd
@@ -11,26 +12,26 @@ import os
 app = FastAPI(title="Octagon Analytics API", version="1.0.0")
 
 # Config
-MLFLOW_URI = os.environ["MLFLOW_URI"]
-DB_CONFIG = {
-    "dbname": os.environ["DB_NAME"],
-    "user": os.environ["DB_USER"],
-    "password": os.environ["DB_PASSWORD"],
-    "host": os.environ["DB_HOST"],
-    "port": os.environ.get("DB_PORT", "5432"),
-}
 
+MLFLOW_URI = os.environ["MLFLOW_URI"]
+import sys
+sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
+from db import get_db
 mlflow.set_tracking_uri(MLFLOW_URI)
 
-# Load production model at startup
 def load_production_model():
-    model_uri = "models:/ufc_fight_predictor@production"
-    return mlflow.xgboost.load_model(model_uri)
+    client = MlflowClient(MLFLOW_URI)
+    prod = client.get_model_version_by_alias("ufc_fight_predictor", "production")
+    model = mlflow.xgboost.load_model(f"models:/ufc_fight_predictor/{prod.version}")
+    auc = client.get_run(prod.run_id).data.metrics.get("test_auc")
+    return model, int(prod.version), auc
 
-model = load_production_model()
+model, MODEL_VERSION, MODEL_AUC = load_production_model()
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
+class FighterNotFoundError(Exception):
+    def __init__(self, name):
+        self.name = name
+        super().__init__(f"Fighter not found: {name}")
 
 def get_fighter_stats(name: str) -> dict:
     conn = get_db()
@@ -124,6 +125,7 @@ def build_features(f1: dict, f2: dict) -> pd.DataFrame:
     
     return pd.DataFrame([features])
 
+# Going to delete this later - leaving for reference for updating upcoming.py 
 def log_prediction(f1: dict, f2: dict, f1_prob: float, f2_prob: float, 
                    event_id: str = None, weight_class: str = None, fight_id: str = None):
     import mlflow
@@ -171,14 +173,41 @@ def log_prediction(f1: dict, f2: dict, f1_prob: float, f2_prob: float,
     conn.commit()
     conn.close()
 
+def predict_fight(f1_name: str, f2_name: str, weight_class: str = None):
+    f1 = get_fighter_stats(f1_name)
+    f2 = get_fighter_stats(f2_name)
+    
+    if not f1:
+        raise FighterNotFoundError(f1_name)
+    if not f2:
+        raise FighterNotFoundError(f2_name)
+
+    features = build_features(f1, f2)
+    if weight_class and f"wc_{weight_class}" in features.columns:
+        features[f"wc_{weight_class}"] = 1
+    
+    prob = model.predict_proba(features)[0]
+    f1_prob = round(float(prob[1]), 4)
+    f2_prob = round(float(prob[0]), 4)
+    
+    confidence = "high" if abs(f1_prob - 0.5) > 0.15 else "medium" if abs(f1_prob - 0.5) > 0.05 else "low"
+    
+    return {
+        "fighter_1": f1['name'],
+        "fighter_2": f2['name'],
+        "fighter_1_win_probability": f1_prob,
+        "fighter_2_win_probability": f2_prob,
+        "predicted_winner": f1['name'] if f1_prob > f2_prob else f2['name'],
+        "confidence": confidence,
+        "model_version": MODEL_VERSION,
+        "model_auc": MODEL_AUC
+    }
 
 # Request/Response models
 class PredictionRequest(BaseModel):
     fighter_1: str
     fighter_2: str
     weight_class: str = None
-    event_id: str = None
-    fight_id: str = None
 
 class PredictionResponse(BaseModel):
     fighter_1: str
@@ -187,6 +216,8 @@ class PredictionResponse(BaseModel):
     fighter_2_win_probability: float
     predicted_winner: str
     confidence: str
+    model_version: int
+    model_auc: float | None
 
 @app.get("/")
 def root():
@@ -196,47 +227,14 @@ def root():
 def health():
     return {"status": "healthy", "model": "ufc_fight_predictor@production"}
 
-# I am going to make this function take in an optional fight id, log conditionall on that
+
 @app.post("/predict", response_model=PredictionResponse)
 def predict(request: PredictionRequest):
-    f1 = get_fighter_stats(request.fighter_1)
-    f2 = get_fighter_stats(request.fighter_2)
-    
-    if not f1:
-        raise HTTPException(status_code=404, detail=f"Fighter not found: {request.fighter_1}")
-    if not f2:
-        raise HTTPException(status_code=404, detail=f"Fighter not found: {request.fighter_2}")
-    
-    # Set weight class if provided
-    features = build_features(f1, f2)
-    if request.weight_class and f"wc_{request.weight_class}" in features.columns:
-        features[f"wc_{request.weight_class}"] = 1
-    
-    prob = model.predict_proba(features)[0]
-    f1_prob = round(float(prob[1]), 4)
-    f2_prob = round(float(prob[0]), 4)
-    
-    confidence = "high" if abs(f1_prob - 0.5) > 0.15 else "medium" if abs(f1_prob - 0.5) > 0.05 else "low"
-    
     try:
-        if request.fight_id:
-            log_prediction(
-                f1, f2, f1_prob, f2_prob,
-                event_id=request.event_id,
-                weight_class=request.weight_class,
-                fight_id=request.fight_id
-            )
-    except Exception as e:
-        print(f"Warning: failed to log prediction: {e}")
-
-    return PredictionResponse(
-        fighter_1=f1['name'],
-        fighter_2=f2['name'],
-        fighter_1_win_probability=f1_prob,
-        fighter_2_win_probability=f2_prob,
-        predicted_winner=f1['name'] if f1_prob > f2_prob else f2['name'],
-        confidence=confidence
-    )
+        result = predict_fight(request.fighter_1, request.fighter_2, request.weight_class)
+    except FighterNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return PredictionResponse(**result)
 
 @app.get("/fighter/{name}")
 def get_fighter(name: str):
@@ -351,6 +349,7 @@ def get_accuracy_by_version():
     conn.close()
     return [dict(zip(cols, row)) for row in rows]
 
+# change to get veresions from load_production model 
 @app.get("/model/current")
 def get_current_model():
     import mlflow

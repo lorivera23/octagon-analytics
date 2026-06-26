@@ -28,6 +28,7 @@ services:
       - DB_PORT=5432
     volumes:
       - ../mlflow/artifacts:/home/mlops/octagon-analytics/mlflow/artifacts
+      - ../scraper:/home/mlops/octagon-analytics/scraper
     depends_on:
       - mlflow
       - postgres
