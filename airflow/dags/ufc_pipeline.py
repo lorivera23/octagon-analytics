@@ -1,14 +1,13 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator, BranchPythonOperator
-from airflow.operators.empty import EmptyOperator
-from datetime import datetime, timedelta
-import pendulum
 import os
+import sys
+import subprocess
+import re
 
-# NOTE: I eventually want to get rid of the sys.insert lines and move to setting PYTHONPATH in the Dockerfile
-#       Also fix the databaase connection in score predictions, the function already manages connection
+import pendulum
+from airflow import DAG
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
 
-MLFLOW_URI = os.environ["MLFLOW_URI"]
 
 default_args = {
     "owner": "mlops",
@@ -26,21 +25,20 @@ with DAG(
 ) as dag:
 
     def run_incremental_task(**context):
-        import sys
-        sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
         import asyncio
         from scraper import run_incremental
+
         return asyncio.run(run_incremental())
     
     def score_pending_predictions(**context):
-        import sys
-        sys.path.insert(0, "/home/mlops/octagon-analytics/scraper") # for getting the db connection
-        sys.path.insert(0, "/home/mlops/octagon-analytics/pipeline_utils")
+        from contextlib import closing
+
         from db import get_db
         from score_predictions import score_pending_predictions as _score
-        from contextlib import closing
+
         with closing(get_db()) as conn:
             scored = _score(conn)
+
         context["ti"].xcom_push(key="scored_count", value=scored)
 
     def branch_on_retrain(**context):
@@ -49,50 +47,55 @@ with DAG(
 
 
     def enrich_new_fighters_task(**context):
-        import sys
-        sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
         import asyncio
-        from enrich_fighters import run_enrichment 
+        from enrich_fighters import run_enrichment
+
         asyncio.run(run_enrichment())
 
     def scrape_upcoming_and_predict_task(**context):
-        import sys
-        sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
         import asyncio
-        from upcoming import run_upcoming           
+        from upcoming import run_upcoming
+
         asyncio.run(run_upcoming())
 
     def retrain_model(**context):
-        import subprocess
-        import re
-
-        env = os.environ.copy()
-        env["PYTHONPATH"] = "/home/mlops/octagon-analytics/training/venv/lib/python3.10/site-packages"
-        env["VIRTUAL_ENV"] = "/home/mlops/octagon-analytics/training/venv"
-
-        result = subprocess.run([
-            "/home/mlops/octagon-analytics/training/venv/bin/python",
-            "/home/mlops/octagon-analytics/training/train.py"
-        ], capture_output=True, text=True, env=env)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "/home/mlops/octagon-analytics/training/train.py",
+            ],
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+        )
 
         print(result.stdout)
+
         if result.returncode != 0:
-            raise Exception(f"Training failed: {result.stderr}")
+            raise RuntimeError(f"Training failed: {result.stderr}")
 
         match = re.search(r"new_version:(\d+)", result.stdout)
-        if match:
-            context["ti"].xcom_push(key="new_version", value=int(match.group(1)))
+
+        if not match:
+            raise RuntimeError(
+                "Training completed but did not return an MLflow model version."
+            )
+
+        context["ti"].xcom_push(
+            key="new_version",
+            value=int(match.group(1)),
+        )
 
     def evaluate_and_promote(**context):
         import mlflow
         from mlflow.tracking import MlflowClient
         from mlflow.exceptions import MlflowException
-        import sys
-        sys.path.insert(0, "/home/mlops/octagon-analytics/pipeline_utils")
         from promotion_smtp import build_report
 
-        mlflow.set_tracking_uri(MLFLOW_URI)
-        client = MlflowClient(MLFLOW_URI)
+        mlflow_uri = os.environ["MLFLOW_URI"]
+
+        mlflow.set_tracking_uri(mlflow_uri)
+        client = MlflowClient(mlflow_uri)
 
         new_version = context["ti"].xcom_pull(task_ids="retrain_model", key="new_version")
         new_event_count = context["ti"].xcom_pull(task_ids="run_incremental")  # return_value, fixed
@@ -133,19 +136,27 @@ with DAG(
         context["ti"].xcom_push(key="promoted", value=promoted)
 
     def send_notification(**context):
-        import os, sys
-        sys.path.insert(0, "/home/mlops/octagon-analytics/pipeline_utils")
         from promotion_smtp import send_email
 
-        report = context["ti"].xcom_pull(task_ids="evaluate_and_promote", key="report")
-        promoted = context["ti"].xcom_pull(task_ids="evaluate_and_promote", key="promoted")
-        subject = f"UFC Pipeline Report — {'Model Promoted ✓' if promoted else 'No Change'}"
+        report = context["ti"].xcom_pull(
+            task_ids="evaluate_and_promote",
+            key="report",
+        )
+        promoted = context["ti"].xcom_pull(
+            task_ids="evaluate_and_promote",
+            key="promoted",
+        )
+
+        subject = (
+            f"UFC Pipeline Report — "
+            f"{'Model Promoted ✓' if promoted else 'No Change'}"
+        )
 
         send_email(
             subject,
             report,
-            sender="loganjrivera@gmail.com",
-            receiver="loganjrivera@gmail.com",
+            sender=os.environ["GMAIL_SENDER"],
+            receiver=os.environ["GMAIL_RECEIVER"],
             password=os.environ["GMAIL_APP_PASSWORD"],
         )
 

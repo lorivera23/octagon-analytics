@@ -1,5 +1,7 @@
 FROM apache/airflow:2.9.3-python3.10
 
+ENV PYTHONPATH="/home/mlops/octagon-analytics/scraper:/home/mlops/octagon-analytics/pipeline_utils:/home/mlops/octagon-analytics/training"
+
 USER root
 
 RUN apt-get update && apt-get install -y \

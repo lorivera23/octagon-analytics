@@ -97,6 +97,8 @@ services:
       - API_URL=http://api:8000
       - MLFLOW_URI=http://mlflow:5000
       - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD}
+      - GMAIL_SENDER=${GMAIL_SENDER}
+      - GMAIL_RECEIVER=${GMAIL_RECEIVER}
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../airflow/logs:/opt/airflow/logs
