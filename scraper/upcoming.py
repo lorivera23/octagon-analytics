@@ -1,11 +1,12 @@
 import asyncio
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
-from contextlib import closing
-from db import get_db
-import requests
-import json
 import os
+from contextlib import closing
+
+import requests
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+
+from db import get_db
 
 BASE_URL = "http://ufcstats.com"
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
@@ -62,7 +63,6 @@ async def get_upcoming_fights(event_url, page):
     fights = []
     for row in rows:
         cols = row.select("td.b-fight-details__table-col")
-        # same column guard mismatch we saw in scraper.py, fix this as well
         if len(cols) < 7:
             continue
 
@@ -73,13 +73,19 @@ async def get_upcoming_fights(event_url, page):
         fight_url = row.get("data-link")
         fight_id = extract_id(fight_url) if fight_url else None
 
+        fighter_1_name = fighter_links[0].text.strip()
+        fighter_2_name = fighter_links[1].text.strip()
+
+        if not fight_id or not fighter_1_name or not fighter_2_name:
+            continue
+
         fights.append({
             "fight_id": fight_id,
-            "fighter_1_name": fighter_links[0].text.strip(),
+            "fighter_1_name": fighter_1_name,
             "fighter_1_url": fighter_links[0]["href"],
-            "fighter_2_name": fighter_links[1].text.strip(),
+            "fighter_2_name": fighter_2_name,
             "fighter_2_url": fighter_links[1]["href"],
-            "weight_class": cols[6].text.strip() if len(cols) > 6 else None,
+            "weight_class": cols[6].text.strip(),
         })
 
     if rows and not fights:
@@ -104,39 +110,48 @@ def save_upcoming_event(conn, event):
         print(f"Error saving event: {e}")
 
 def predict_and_store(conn, fight, event_id, existing_predictions):
-    if not fight["fight_id"] or fight["fight_id"] in existing_predictions:
+    if fight["fight_id"] in existing_predictions:
         return "skipped"
 
     try:
-        response = requests.post(f"{API_URL}/predict", json={
-            "fighter_1": fight["fighter_1_name"],
-            "fighter_2": fight["fighter_2_name"],
-            "weight_class": fight["weight_class"],
-            "event_id": event_id,
-            "fight_id": fight["fight_id"],
-        }, timeout=10)
+        response = requests.post(
+            f"{API_URL}/predict",
+            json={
+                "fighter_1": fight["fighter_1_name"],
+                "fighter_2": fight["fighter_2_name"],
+                "weight_class": fight["weight_class"],
+                "event_id": event_id,
+                "fight_id": fight["fight_id"],
+            },
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"Prediction API unavailable for "
+            f"{fight['fighter_1_name']} vs {fight['fighter_2_name']}: {e}"
+        ) from e
 
-        # add a check for a 500 connection error, this would mean that the api service is down, and would need a error raised
-        # not skipped
-        # also add a check to make sure that the fight_id, fighter_1_name, and fighter_name are all actually caught when stitched
-        if response.status_code == 200:
-            result = response.json()
-            print(f"  {fight['fighter_1_name']} vs {fight['fighter_2_name']} → {result['predicted_winner']} ({result['fighter_1_win_probability']:.0%} / {result['fighter_2_win_probability']:.0%})")
-            return "predicted"
-        elif response.status_code == 404:
-            print(f"  Skipped {fight['fighter_1_name']} vs {fight['fighter_2_name']} — fighter not in DB")
-            return "skipped"
-        else:
-            # 500 / unexpected — API problem, not a missing fighter. Surface it.
-            raise RuntimeError(
-                f"API returned {response.status_code} for "
-                f"{fight['fighter_1_name']} vs {fight['fighter_2_name']}"
-            )
+    if response.status_code == 200:
+        result = response.json()
+        print(
+            f"  {fight['fighter_1_name']} vs {fight['fighter_2_name']} "
+            f"→ {result['predicted_winner']} "
+            f"({result['fighter_1_win_probability']:.0%} / "
+            f"{result['fighter_2_win_probability']:.0%})"
+        )
+        return "predicted"
 
-    except Exception as e:
-        conn.rollback()
-        print(f"  Error predicting {fight['fighter_1_name']} vs {fight['fighter_2_name']}: {e}")
-        return "error"
+    if response.status_code == 404:
+        print(
+            f"  Skipped {fight['fighter_1_name']} vs "
+            f"{fight['fighter_2_name']} — fighter not in DB"
+        )
+        return "skipped"
+
+    raise RuntimeError(
+        f"API returned {response.status_code} for "
+        f"{fight['fighter_1_name']} vs {fight['fighter_2_name']}"
+    )
 
 async def run_upcoming():
     with closing(get_db()) as conn:
@@ -152,8 +167,7 @@ async def run_upcoming():
             print(f"Found {len(events)} upcoming events")
 
             failed_events = []
-            predict_attempts = 0
-            predict_errors = 0
+
 
             for event in events:
                 print(f"\n{event['name']} ({event['date']})")
@@ -166,11 +180,6 @@ async def run_upcoming():
                         result = predict_and_store(conn, fight, event["event_id"], existing_predictions)
                         if result == "predicted":
                             predicted += 1
-                        elif result == "error":
-                            predict_errors += 1
-                        if result in ("predicted", "error"):
-                            predict_attempts += 1
-                        
                     print(f"  → {predicted} predictions stored")
                 except Exception as e:
                     failed_events.append(event["name"])
@@ -185,10 +194,7 @@ async def run_upcoming():
                 f"All {len(events)} upcoming events failed to scrape — systemic failure. "
                 f"Examples: {failed_events[:3]}"
             )
-        if predict_attempts and predict_errors == predict_attempts:
-            raise RuntimeError(
-                f"All {predict_attempts} prediction attempts errored — API likely down."
-            )
+
         if failed_events:
             print(f"WARNING: {len(failed_events)}/{len(events)} events failed: {failed_events}")
 
