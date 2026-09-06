@@ -133,12 +133,28 @@ def build_dataset(engine):
 
     # Fighter history
     history_query = """
-    SELECT fi.fight_id, fi.fighter_1_id as winner_id, fi.fighter_2_id as loser_id,
-        e.date, f1.dob as winner_dob, f2.dob as loser_dob
+    SELECT
+        fi.fight_id,
+        fi.winner_id,
+        CASE
+            WHEN fi.winner_id = fi.fighter_1_id THEN fi.fighter_2_id
+            ELSE fi.fighter_1_id
+        END AS loser_id,
+        e.date,
+        fw.dob AS winner_dob,
+        fl.dob AS loser_dob
     FROM fights fi
-    JOIN events e ON fi.event_id = e.event_id
-    JOIN fighters f1 ON fi.fighter_1_id = f1.fighter_id
-    JOIN fighters f2 ON fi.fighter_2_id = f2.fighter_id
+    JOIN events e
+        ON fi.event_id = e.event_id
+    JOIN fighters fw
+        ON fi.winner_id = fw.fighter_id
+    JOIN fighters fl
+        ON (
+            CASE
+                WHEN fi.winner_id = fi.fighter_1_id THEN fi.fighter_2_id
+                ELSE fi.fighter_1_id
+            END
+        ) = fl.fighter_id
     WHERE fi.winner_id IS NOT NULL
     ORDER BY e.date ASC
     """
