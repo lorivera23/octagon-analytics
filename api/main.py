@@ -1,213 +1,556 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from mlflow.tracking import MlflowClient
+import os
+
 import mlflow
 import mlflow.xgboost
 import pandas as pd
 import psycopg2
-import numpy as np
-import requests
-import os
+from fastapi import FastAPI, HTTPException
+from mlflow.tracking import MlflowClient
+from pydantic import BaseModel
+
 
 app = FastAPI(title="Octagon Analytics API", version="1.0.0")
 
-# Config
-
 MLFLOW_URI = os.environ["MLFLOW_URI"]
-import sys
-sys.path.insert(0, "/home/mlops/octagon-analytics/scraper")
-from db import get_db
+
+WEIGHT_CLASS_FEATURES = [
+    "wc_Bantamweight",
+    "wc_Catch Weight",
+    "wc_Featherweight",
+    "wc_Flyweight",
+    "wc_Heavyweight",
+    "wc_Light Heavyweight",
+    "wc_Lightweight",
+    "wc_Middleweight",
+    "wc_Open Weight",
+    "wc_Super Heavyweight",
+    "wc_Welterweight",
+    "wc_Women's Bantamweight",
+    "wc_Women's Featherweight",
+    "wc_Women's Flyweight",
+    "wc_Women's Strawweight",
+]
+
+FEATURE_COLS = [
+    "height_diff",
+    "reach_diff",
+    "experience_diff",
+    "win_streak_diff",
+    "recent_form_diff",
+    "days_since_last_diff",
+    "age_diff",
+    "stance_same",
+    "stance_ortho_vs_south",
+    "stance_other",
+    "stance_unknown",
+    *WEIGHT_CLASS_FEATURES,
+]
+
+
+def get_db():
+    return psycopg2.connect(
+        dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        host=os.environ["DB_HOST"],
+        port=os.environ.get("DB_PORT", "5432"),
+    )
+
+
 mlflow.set_tracking_uri(MLFLOW_URI)
+
 
 def load_production_model():
     client = MlflowClient(MLFLOW_URI)
-    prod = client.get_model_version_by_alias("ufc_fight_predictor", "production")
-    model = mlflow.xgboost.load_model(f"models:/ufc_fight_predictor/{prod.version}")
-    auc = client.get_run(prod.run_id).data.metrics.get("test_auc")
-    return model, int(prod.version), auc
+
+    production = client.get_model_version_by_alias(
+        "ufc_fight_predictor",
+        "production",
+    )
+
+    model = mlflow.xgboost.load_model(
+        f"models:/ufc_fight_predictor/{production.version}"
+    )
+
+    auc = client.get_run(
+        production.run_id
+    ).data.metrics.get("test_auc")
+
+    return model, int(production.version), auc
+
 
 model, MODEL_VERSION, MODEL_AUC = load_production_model()
+
 
 class FighterNotFoundError(Exception):
     def __init__(self, name):
         self.name = name
         super().__init__(f"Fighter not found: {name}")
 
-def get_fighter_stats(name: str) -> dict:
+
+def get_fighter_stats(name: str) -> dict | None:
+    """
+    Return the stored fighter profile.
+
+    Career aggregate striking/grappling statistics remain available to the
+    frontend, but they are intentionally not used by the prediction model
+    because they represent a current snapshot rather than historical values.
+    """
     conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT 
-                fighter_id, name, height, reach, stance,
-                slpm, str_acc, sapm, str_def,
-                td_avg, td_acc, td_def, sub_avg
-            FROM fighters
-            WHERE LOWER(name) = LOWER(%s)
-            LIMIT 1
-        """, (name,))
-        row = cur.fetchone()
-    conn.close()
-    
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    fighter_id,
+                    name,
+                    height,
+                    reach,
+                    stance,
+                    dob,
+                    weight,
+                    slpm,
+                    str_acc,
+                    sapm,
+                    str_def,
+                    td_avg,
+                    td_acc,
+                    td_def,
+                    sub_avg
+                FROM fighters
+                WHERE LOWER(name) = LOWER(%s)
+                LIMIT 1
+                """,
+                (name,),
+            )
+
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
     if not row:
         return None
-    
-    cols = ['fighter_id', 'name', 'height', 'reach', 'stance',
-            'slpm', 'str_acc', 'sapm', 'str_def',
-            'td_avg', 'td_acc', 'td_def', 'sub_avg']
-    return dict(zip(cols, row))
 
-def height_to_inches(val):
+    columns = [
+        "fighter_id",
+        "name",
+        "height",
+        "reach",
+        "stance",
+        "dob",
+        "weight",
+        "slpm",
+        "str_acc",
+        "sapm",
+        "str_def",
+        "td_avg",
+        "td_acc",
+        "td_def",
+        "sub_avg",
+    ]
+
+    return dict(zip(columns, row))
+
+
+def height_to_inches(value):
     try:
-        parts = str(val).replace('"', '').split("'")
-        return int(parts[0]) * 12 + int(parts[1].strip())
-    except:
+        feet, inches = str(value).replace('"', "").split("'")
+        return int(feet) * 12 + int(inches.strip())
+    except (TypeError, ValueError):
         return None
 
-def pct_to_float(val):
+
+def reach_to_float(value):
     try:
-        return float(str(val).replace('%', '')) / 100
-    except:
+        return float(str(value).replace('"', "").strip())
+    except (TypeError, ValueError):
         return None
 
-def build_features(f1: dict, f2: dict) -> pd.DataFrame:
-    def parse(f):
-        def to_float(val):
-            try:
-                return float(val) if val is not None else None
-            except:
-                return None
-    
-        return {
-            'height_in': height_to_inches(f.get('height')),
-            'reach_in': float(str(f.get('reach', '')).replace('"', '').strip()) if f.get('reach') else None,
-            'slpm': to_float(f.get('slpm')),
-            'sapm': to_float(f.get('sapm')),
-            'str_acc': pct_to_float(f.get('str_acc')),
-            'str_def': pct_to_float(f.get('str_def')),
-            'td_avg': to_float(f.get('td_avg')),
-            'td_acc': pct_to_float(f.get('td_acc')),
-            'td_def': pct_to_float(f.get('td_def')),
-            'sub_avg': to_float(f.get('sub_avg')),
-        }
 
-    p1, p2 = parse(f1), parse(f2)
-    
-    features = {
-        'height_diff':       (p1['height_in'] or 0) - (p2['height_in'] or 0),
-        'reach_diff':        (p1['reach_in'] or 0)  - (p2['reach_in'] or 0),
-        'slpm_diff':         (p1['slpm'] or 0)      - (p2['slpm'] or 0),
-        'sapm_diff':         (p1['sapm'] or 0)      - (p2['sapm'] or 0),
-        'str_acc_diff':      (p1['str_acc'] or 0)   - (p2['str_acc'] or 0),
-        'str_def_diff':      (p1['str_def'] or 0)   - (p2['str_def'] or 0),
-        'td_avg_diff':       (p1['td_avg'] or 0)    - (p2['td_avg'] or 0),
-        'td_acc_diff':       (p1['td_acc'] or 0)    - (p2['td_acc'] or 0),
-        'td_def_diff':       (p1['td_def'] or 0)    - (p2['td_def'] or 0),
-        'sub_avg_diff':      (p1['sub_avg'] or 0)   - (p2['sub_avg'] or 0),
-        'experience_diff':   0,
-        'win_streak_diff':   0,
-        'recent_form_diff':  0,
-        'days_since_last_diff': 0,
-        'age_diff':          0,
-        'is_title_fight':    0,
-        'stance_same':       1 if f1.get('stance') == f2.get('stance') else 0,
-        'stance_ortho_vs_south': 1 if set([f1.get('stance'), f2.get('stance')]) == {'Orthodox', 'Southpaw'} else 0,
-        'stance_other':      0,
-        'stance_unknown':    0,
-        'wc_Bantamweight':   0, 'wc_Catch Weight':     0,
-        'wc_Featherweight':  0, 'wc_Flyweight':        0,
-        'wc_Heavyweight':    0, 'wc_Light Heavyweight': 0,
-        'wc_Lightweight':    0, 'wc_Middleweight':     0,
-        'wc_Open Weight':    0, 'wc_Super Heavyweight': 0,
-        'wc_Welterweight':   0, 'wc_Women\'s Bantamweight': 0,
-        'wc_Women\'s Featherweight': 0, 'wc_Women\'s Flyweight': 0,
-        'wc_Women\'s Strawweight': 0,
+def numeric_difference(value_1, value_2):
+    if value_1 is None or value_2 is None:
+        return None
+
+    return value_1 - value_2
+
+
+def get_prediction_date(conn, event_id: str | None):
+    if event_id:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT date
+                FROM events
+                WHERE event_id = %s
+                """,
+                (event_id,),
+            )
+
+            row = cur.fetchone()
+
+        if row and row[0]:
+            return pd.Timestamp(row[0])
+
+    return pd.Timestamp.today().normalize()
+
+
+def get_fighter_history(
+    conn,
+    fighter_id: str,
+    dob,
+    as_of_date,
+):
+    """
+    Calculate fighter state using only fights that occurred before the
+    requested prediction date.
+    """
+    as_of_date = pd.Timestamp(as_of_date)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                e.date,
+                fi.winner_id
+            FROM fights fi
+            JOIN events e
+                ON fi.event_id = e.event_id
+            WHERE
+                (
+                    fi.fighter_1_id = %s
+                    OR fi.fighter_2_id = %s
+                )
+                AND fi.winner_id IS NOT NULL
+                AND e.date < %s
+            ORDER BY e.date ASC, fi.fight_id ASC
+            """,
+            (
+                fighter_id,
+                fighter_id,
+                as_of_date.date(),
+            ),
+        )
+
+        rows = cur.fetchall()
+
+    wins = [
+        winner_id == fighter_id
+        for _, winner_id in rows
+    ]
+
+    win_streak = 0
+
+    for won in reversed(wins):
+        if not won:
+            break
+
+        win_streak += 1
+
+    recent_results = wins[-5:]
+
+    if recent_results:
+        recent_form = sum(recent_results) / len(recent_results)
+    else:
+        recent_form = 0.5
+
+    if rows:
+        last_fight_date = pd.Timestamp(rows[-1][0])
+        days_since_last = (as_of_date - last_fight_date).days
+    else:
+        days_since_last = None
+
+    dob = pd.to_datetime(dob, errors="coerce")
+
+    age = (
+        (as_of_date - dob).days / 365.25
+        if pd.notna(dob)
+        else None
+    )
+
+    return {
+        "experience": len(rows),
+        "win_streak": win_streak,
+        "recent_form": recent_form,
+        "days_since_last": days_since_last,
+        "age": age,
     }
-    
-    return pd.DataFrame([features])
 
-# Going to delete this later - leaving for reference for updating upcoming.py 
-def log_prediction(f1: dict, f2: dict, f1_prob: float, f2_prob: float, 
-                   event_id: str = None, weight_class: str = None, fight_id: str = None):
-    import mlflow
-    from mlflow.tracking import MlflowClient
-    
-    # Get current production model version and AUC
-    try:
-        mlflow.set_tracking_uri(MLFLOW_URI)
-        client = MlflowClient(MLFLOW_URI)
-        prod = client.get_model_version_by_alias("ufc_fight_predictor", "production")
-        prod_run = client.get_run(prod.run_id)
-        model_version = int(prod.version)
-        model_auc = prod_run.data.metrics.get("test_auc", None)
-    except:
-        model_version = None
-        model_auc = None
 
-    predicted_winner_id = f1['fighter_id'] if f1_prob > f2_prob else f2['fighter_id']
+def build_features(
+    conn,
+    fighter_1: dict,
+    fighter_2: dict,
+    weight_class: str | None = None,
+    event_id: str | None = None,
+) -> pd.DataFrame:
+    prediction_date = get_prediction_date(
+        conn,
+        event_id,
+    )
+
+    fighter_1_history = get_fighter_history(
+        conn,
+        fighter_1["fighter_id"],
+        fighter_1.get("dob"),
+        prediction_date,
+    )
+
+    fighter_2_history = get_fighter_history(
+        conn,
+        fighter_2["fighter_id"],
+        fighter_2.get("dob"),
+        prediction_date,
+    )
+
+    fighter_1_height = height_to_inches(
+        fighter_1.get("height")
+    )
+    fighter_2_height = height_to_inches(
+        fighter_2.get("height")
+    )
+
+    fighter_1_reach = reach_to_float(
+        fighter_1.get("reach")
+    )
+    fighter_2_reach = reach_to_float(
+        fighter_2.get("reach")
+    )
+
+    stance_1 = (
+        fighter_1.get("stance", "").strip().lower()
+        if fighter_1.get("stance")
+        else None
+    )
+
+    stance_2 = (
+        fighter_2.get("stance", "").strip().lower()
+        if fighter_2.get("stance")
+        else None
+    )
+
+    if not stance_1 or not stance_2:
+        stance_matchup = "unknown"
+    elif stance_1 == stance_2:
+        stance_matchup = "same"
+    elif {stance_1, stance_2} == {"orthodox", "southpaw"}:
+        stance_matchup = "ortho_vs_south"
+    else:
+        stance_matchup = "other"
+
+    features = {
+        "height_diff": numeric_difference(
+            fighter_1_height,
+            fighter_2_height,
+        ),
+        "reach_diff": numeric_difference(
+            fighter_1_reach,
+            fighter_2_reach,
+        ),
+        "experience_diff": (
+            fighter_1_history["experience"]
+            - fighter_2_history["experience"]
+        ),
+        "win_streak_diff": (
+            fighter_1_history["win_streak"]
+            - fighter_2_history["win_streak"]
+        ),
+        "recent_form_diff": (
+            fighter_1_history["recent_form"]
+            - fighter_2_history["recent_form"]
+        ),
+        "days_since_last_diff": numeric_difference(
+            fighter_1_history["days_since_last"],
+            fighter_2_history["days_since_last"],
+        ),
+        "age_diff": numeric_difference(
+            fighter_1_history["age"],
+            fighter_2_history["age"],
+        ),
+        "stance_same": int(stance_matchup == "same"),
+        "stance_ortho_vs_south": int(
+            stance_matchup == "ortho_vs_south"
+        ),
+        "stance_other": int(stance_matchup == "other"),
+        "stance_unknown": int(
+            stance_matchup == "unknown"
+        ),
+    }
+
+    for feature in WEIGHT_CLASS_FEATURES:
+        features[feature] = 0
+
+    weight_feature = (
+        f"wc_{weight_class}"
+        if weight_class
+        else None
+    )
+
+    if weight_feature in WEIGHT_CLASS_FEATURES:
+        features[weight_feature] = 1
+
+    feature_frame = pd.DataFrame(
+        [features],
+        columns=FEATURE_COLS,
+    )
+
+    # Training uses a constant-zero imputer, so inference mirrors the same
+    # preprocessing for unavailable measurements.
+    return feature_frame.fillna(0)
+
+
+def store_prediction(
+    fighter_1: dict,
+    fighter_2: dict,
+    fighter_1_probability: float,
+    fighter_2_probability: float,
+    event_id: str,
+    fight_id: str,
+    weight_class: str | None,
+):
+    predicted_winner_id = (
+        fighter_1["fighter_id"]
+        if fighter_1_probability > fighter_2_probability
+        else fighter_2["fighter_id"]
+    )
 
     conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO predictions (
-                fight_id, event_id, fighter_1_id, fighter_2_id,
-                fighter_1_name, fighter_2_name,
-                fighter_1_win_prob, fighter_2_win_prob,
-                predicted_winner_id, model_version, model_auc,
-                weight_class, is_upcoming
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (
-            fight_id,
-            event_id,
-            f1['fighter_id'],
-            f2['fighter_id'],
-            f1['name'],
-            f2['name'],
-            f1_prob,
-            f2_prob,
-            predicted_winner_id,
-            model_version,
-            model_auc,
-            weight_class,
-            True
-        ))
-    conn.commit()
-    conn.close()
 
-def predict_fight(f1_name: str, f2_name: str, weight_class: str = None):
-    f1 = get_fighter_stats(f1_name)
-    f2 = get_fighter_stats(f2_name)
-    
-    if not f1:
-        raise FighterNotFoundError(f1_name)
-    if not f2:
-        raise FighterNotFoundError(f2_name)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO predictions (
+                    fight_id,
+                    event_id,
+                    fighter_1_id,
+                    fighter_2_id,
+                    fighter_1_name,
+                    fighter_2_name,
+                    fighter_1_win_prob,
+                    fighter_2_win_prob,
+                    predicted_winner_id,
+                    model_version,
+                    model_auc,
+                    weight_class,
+                    is_upcoming
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, TRUE
+                )
+                """,
+                (
+                    fight_id,
+                    event_id,
+                    fighter_1["fighter_id"],
+                    fighter_2["fighter_id"],
+                    fighter_1["name"],
+                    fighter_2["name"],
+                    fighter_1_probability,
+                    fighter_2_probability,
+                    predicted_winner_id,
+                    MODEL_VERSION,
+                    MODEL_AUC,
+                    weight_class,
+                ),
+            )
 
-    features = build_features(f1, f2)
-    if weight_class and f"wc_{weight_class}" in features.columns:
-        features[f"wc_{weight_class}"] = 1
-    
-    prob = model.predict_proba(features)[0]
-    f1_prob = round(float(prob[1]), 4)
-    f2_prob = round(float(prob[0]), 4)
-    
-    confidence = "high" if abs(f1_prob - 0.5) > 0.15 else "medium" if abs(f1_prob - 0.5) > 0.05 else "low"
-    
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def predict_fight(
+    fighter_1_name: str,
+    fighter_2_name: str,
+    weight_class: str | None = None,
+    event_id: str | None = None,
+):
+    fighter_1 = get_fighter_stats(
+        fighter_1_name
+    )
+    fighter_2 = get_fighter_stats(
+        fighter_2_name
+    )
+
+    if not fighter_1:
+        raise FighterNotFoundError(
+            fighter_1_name
+        )
+
+    if not fighter_2:
+        raise FighterNotFoundError(
+            fighter_2_name
+        )
+
+    conn = get_db()
+
+    try:
+        features = build_features(
+            conn,
+            fighter_1,
+            fighter_2,
+            weight_class=weight_class,
+            event_id=event_id,
+        )
+    finally:
+        conn.close()
+
+    probabilities = model.predict_proba(
+        features
+    )[0]
+
+    fighter_1_probability = round(
+        float(probabilities[1]),
+        4,
+    )
+
+    fighter_2_probability = round(
+        float(probabilities[0]),
+        4,
+    )
+
+    margin = abs(
+        fighter_1_probability - 0.5
+    )
+
+    if margin > 0.15:
+        confidence = "high"
+    elif margin > 0.05:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
     return {
-        "fighter_1": f1['name'],
-        "fighter_2": f2['name'],
-        "fighter_1_win_probability": f1_prob,
-        "fighter_2_win_probability": f2_prob,
-        "predicted_winner": f1['name'] if f1_prob > f2_prob else f2['name'],
+        "fighter_1": fighter_1["name"],
+        "fighter_2": fighter_2["name"],
+        "fighter_1_win_probability": fighter_1_probability,
+        "fighter_2_win_probability": fighter_2_probability,
+        "predicted_winner": (
+            fighter_1["name"]
+            if fighter_1_probability
+            > fighter_2_probability
+            else fighter_2["name"]
+        ),
         "confidence": confidence,
         "model_version": MODEL_VERSION,
-        "model_auc": MODEL_AUC
+        "model_auc": MODEL_AUC,
+        "_fighter_1": fighter_1,
+        "_fighter_2": fighter_2,
     }
 
-# Request/Response models
+
 class PredictionRequest(BaseModel):
     fighter_1: str
     fighter_2: str
-    weight_class: str = None
+    weight_class: str | None = None
+    event_id: str | None = None
+    fight_id: str | None = None
+
 
 class PredictionResponse(BaseModel):
     fighter_1: str
@@ -231,9 +574,34 @@ def health():
 @app.post("/predict", response_model=PredictionResponse)
 def predict(request: PredictionRequest):
     try:
-        result = predict_fight(request.fighter_1, request.fighter_2, request.weight_class)
-    except FighterNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        result = predict_fight(
+            request.fighter_1,
+            request.fighter_2,
+            weight_class=request.weight_class,
+            event_id=request.event_id,
+        )
+    except FighterNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        ) from exc
+
+    fighter_1 = result.pop("_fighter_1")
+    fighter_2 = result.pop("_fighter_2")
+
+    # Upcoming-fight requests include these identifiers. Custom matchup
+    # requests from the frontend do not need to be persisted.
+    if request.fight_id and request.event_id:
+        store_prediction(
+            fighter_1,
+            fighter_2,
+            result["fighter_1_win_probability"],
+            result["fighter_2_win_probability"],
+            event_id=request.event_id,
+            fight_id=request.fight_id,
+            weight_class=request.weight_class,
+        )
+
     return PredictionResponse(**result)
 
 @app.get("/fighter/{name}")

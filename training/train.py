@@ -1,306 +1,493 @@
-import sys
 import os
+from collections import defaultdict
+
 import mlflow
 import mlflow.xgboost
 import pandas as pd
-import numpy as np
-from sqlalchemy import create_engine
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
+from mlflow.models import infer_signature
 from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
+from sqlalchemy import create_engine
 from xgboost import XGBClassifier
-from collections import defaultdict
-import os
 
-DB_URI = f"postgresql://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}@{os.environ['DB_HOST']}:{os.environ.get('DB_PORT','5432')}/{os.environ['DB_NAME']}"
+
+DB_URI = (
+    f"postgresql://{os.environ['DB_USER']}:{os.environ['DB_PASSWORD']}"
+    f"@{os.environ['DB_HOST']}:{os.environ.get('DB_PORT', '5432')}"
+    f"/{os.environ['DB_NAME']}"
+)
+
 MLFLOW_URI = os.environ["MLFLOW_URI"]
+
+WEIGHT_CLASS_FEATURES = [
+    "wc_Bantamweight",
+    "wc_Catch Weight",
+    "wc_Featherweight",
+    "wc_Flyweight",
+    "wc_Heavyweight",
+    "wc_Light Heavyweight",
+    "wc_Lightweight",
+    "wc_Middleweight",
+    "wc_Open Weight",
+    "wc_Super Heavyweight",
+    "wc_Welterweight",
+    "wc_Women's Bantamweight",
+    "wc_Women's Featherweight",
+    "wc_Women's Flyweight",
+    "wc_Women's Strawweight",
+]
+
+FEATURE_COLS = [
+    "height_diff",
+    "reach_diff",
+    "experience_diff",
+    "win_streak_diff",
+    "recent_form_diff",
+    "days_since_last_diff",
+    "age_diff",
+    "stance_same",
+    "stance_ortho_vs_south",
+    "stance_other",
+    "stance_unknown",
+    *WEIGHT_CLASS_FEATURES,
+]
+
+# These features reverse sign when fighter 1 and fighter 2 are swapped.
+DIRECTIONAL_FEATURES = [
+    "height_diff",
+    "reach_diff",
+    "experience_diff",
+    "win_streak_diff",
+    "recent_form_diff",
+    "days_since_last_diff",
+    "age_diff",
+]
 
 
 def get_engine():
     return create_engine(DB_URI)
 
-def pct_to_float(val):
+
+def height_to_inches(value):
     try:
-        return float(str(val).replace('%', '')) / 100
-    except:
+        feet, inches = str(value).replace('"', "").split("'")
+        return int(feet) * 12 + int(inches.strip())
+    except (TypeError, ValueError):
         return None
 
-def height_to_inches(val):
+
+def reach_to_float(value):
     try:
-        parts = str(val).replace('"', '').split("'")
-        return int(parts[0]) * 12 + int(parts[1].strip())
-    except:
+        return float(str(value).replace('"', "").strip())
+    except (TypeError, ValueError):
         return None
 
-def reach_to_float(val):
-    try:
-        return float(str(val).replace('"', '').strip())
-    except:
-        return None
-
-def clean_method(method):
-    if pd.isna(method):
-        return 'Unknown'
-    method = method.upper()
-    if 'DEC' in method:
-        return 'Decision'
-    elif 'KO' in method or 'TKO' in method:
-        return 'KO/TKO'
-    elif any(x in method for x in ['CHOKE','LOCK','BAR','TRIANGLE','ANACONDA','GUILLOTINE','SUB']):
-        return 'Submission'
-    elif 'DRAW' in method or 'NC' in method:
-        return 'Draw/NC'
-    else:
-        return 'Other'
 
 def compute_fighter_history(history_df):
+    """
+    Build pre-fight history features in chronological order.
+
+    Fighter state is calculated before the current fight result is added,
+    preventing the current fight from leaking into its own features.
+    """
     fighter_record = defaultdict(list)
     results = []
 
     for _, row in history_df.iterrows():
-        fight_id = row['fight_id']
-        winner_id = row['winner_id']
-        loser_id = row['loser_id']
-        date = row['date']
+        fight_date = row["date"]
 
         def get_stats(fighter_id, dob):
             past_fights = fighter_record[fighter_id]
-            n = len(past_fights)
-            if n == 0:
+            wins = [fight["won"] for fight in past_fights]
+
+            if not past_fights:
                 return {
-                    'experience': 0, 'win_streak': 0, 'recent_form': 0.5,
-                    'days_since_last': None,
-                    'age': (date - dob).days / 365.25 if pd.notna(dob) else None
+                    "experience": 0,
+                    "win_streak": 0,
+                    "recent_form": 0.5,
+                    "days_since_last": None,
+                    "age": (
+                        (fight_date - dob).days / 365.25
+                        if pd.notna(dob)
+                        else None
+                    ),
                 }
-            wins = [f['won'] for f in past_fights]
-            dates = [f['date'] for f in past_fights]
-            streak = 0
-            for w in reversed(wins):
-                if w: streak += 1
-                else: break
-            recent = wins[-5:]
+
+            win_streak = 0
+            for won in reversed(wins):
+                if not won:
+                    break
+                win_streak += 1
+
+            recent_results = wins[-5:]
+
             return {
-                'experience': n,
-                'win_streak': streak,
-                'recent_form': sum(recent) / len(recent),
-                'days_since_last': (date - dates[-1]).days,
-                'age': (date - dob).days / 365.25 if pd.notna(dob) else None
+                "experience": len(past_fights),
+                "win_streak": win_streak,
+                "recent_form": sum(recent_results) / len(recent_results),
+                "days_since_last": (
+                    fight_date - past_fights[-1]["date"]
+                ).days,
+                "age": (
+                    (fight_date - dob).days / 365.25
+                    if pd.notna(dob)
+                    else None
+                ),
             }
 
-        winner_stats = get_stats(winner_id, row['winner_dob'])
-        loser_stats = get_stats(loser_id, row['loser_dob'])
+        fighter_1_stats = get_stats(
+            row["fighter_1_id"],
+            row["fighter_1_dob"],
+        )
+        fighter_2_stats = get_stats(
+            row["fighter_2_id"],
+            row["fighter_2_dob"],
+        )
 
-        results.append({
-            'fight_id': fight_id,
-            'f1_experience': winner_stats['experience'],
-            'f1_win_streak': winner_stats['win_streak'],
-            'f1_recent_form': winner_stats['recent_form'],
-            'f1_days_since_last': winner_stats['days_since_last'],
-            'f1_age': winner_stats['age'],
-            'f2_experience': loser_stats['experience'],
-            'f2_win_streak': loser_stats['win_streak'],
-            'f2_recent_form': loser_stats['recent_form'],
-            'f2_days_since_last': loser_stats['days_since_last'],
-            'f2_age': loser_stats['age'],
-        })
+        results.append(
+            {
+                "fight_id": row["fight_id"],
+                "f1_experience": fighter_1_stats["experience"],
+                "f1_win_streak": fighter_1_stats["win_streak"],
+                "f1_recent_form": fighter_1_stats["recent_form"],
+                "f1_days_since_last": fighter_1_stats["days_since_last"],
+                "f1_age": fighter_1_stats["age"],
+                "f2_experience": fighter_2_stats["experience"],
+                "f2_win_streak": fighter_2_stats["win_streak"],
+                "f2_recent_form": fighter_2_stats["recent_form"],
+                "f2_days_since_last": fighter_2_stats["days_since_last"],
+                "f2_age": fighter_2_stats["age"],
+            }
+        )
 
-        fighter_record[winner_id].append({'date': date, 'won': True})
-        fighter_record[loser_id].append({'date': date, 'won': False})
+        fighter_1_won = row["winner_id"] == row["fighter_1_id"]
+        fighter_2_won = row["winner_id"] == row["fighter_2_id"]
+
+        fighter_record[row["fighter_1_id"]].append(
+            {"date": fight_date, "won": fighter_1_won}
+        )
+        fighter_record[row["fighter_2_id"]].append(
+            {"date": fight_date, "won": fighter_2_won}
+        )
 
     return pd.DataFrame(results)
 
-def build_dataset(engine):
-    # Load joined dataset
-    query = """
-    SELECT fi.fight_id, fi.method, e.date, fi.weight_class, fi.is_title_fight,
-        f1.name as fighter_1_name, f1.height as f1_height, f1.reach as f1_reach,
-        f1.stance as f1_stance, f1.slpm as f1_slpm, f1.str_acc as f1_str_acc,
-        f1.sapm as f1_sapm, f1.str_def as f1_str_def, f1.td_avg as f1_td_avg,
-        f1.td_acc as f1_td_acc, f1.td_def as f1_td_def, f1.sub_avg as f1_sub_avg,
-        f2.name as fighter_2_name, f2.height as f2_height, f2.reach as f2_reach,
-        f2.stance as f2_stance, f2.slpm as f2_slpm, f2.str_acc as f2_str_acc,
-        f2.sapm as f2_sapm, f2.str_def as f2_str_def, f2.td_avg as f2_td_avg,
-        f2.td_acc as f2_td_acc, f2.td_def as f2_td_def, f2.sub_avg as f2_sub_avg,
-        CASE WHEN fi.winner_id = fi.fighter_1_id THEN 1 ELSE 0 END as fighter_1_won
-    FROM fights fi
-    JOIN events e ON fi.event_id = e.event_id
-    JOIN fighters f1 ON fi.fighter_1_id = f1.fighter_id
-    JOIN fighters f2 ON fi.fighter_2_id = f2.fighter_id
-    WHERE fi.winner_id IS NOT NULL
-    """
-    df = pd.read_sql(query, engine)
-    df['method_clean'] = df['method'].apply(clean_method)
 
-    # Fighter history
-    history_query = """
+def build_dataset(engine):
+    query = """
     SELECT
         fi.fight_id,
+        fi.fighter_1_id,
+        fi.fighter_2_id,
         fi.winner_id,
-        CASE
-            WHEN fi.winner_id = fi.fighter_1_id THEN fi.fighter_2_id
-            ELSE fi.fighter_1_id
-        END AS loser_id,
         e.date,
-        fw.dob AS winner_dob,
-        fl.dob AS loser_dob
+        fi.weight_class,
+        f1.height AS f1_height,
+        f1.reach AS f1_reach,
+        f1.stance AS f1_stance,
+        f2.height AS f2_height,
+        f2.reach AS f2_reach,
+        f2.stance AS f2_stance,
+        CASE
+            WHEN fi.winner_id = fi.fighter_1_id THEN 1
+            ELSE 0
+        END AS fighter_1_won
     FROM fights fi
     JOIN events e
         ON fi.event_id = e.event_id
-    JOIN fighters fw
-        ON fi.winner_id = fw.fighter_id
-    JOIN fighters fl
-        ON (
-            CASE
-                WHEN fi.winner_id = fi.fighter_1_id THEN fi.fighter_2_id
-                ELSE fi.fighter_1_id
-            END
-        ) = fl.fighter_id
+    JOIN fighters f1
+        ON fi.fighter_1_id = f1.fighter_id
+    JOIN fighters f2
+        ON fi.fighter_2_id = f2.fighter_id
     WHERE fi.winner_id IS NOT NULL
-    ORDER BY e.date ASC
     """
+
+    df = pd.read_sql(query, engine)
+    df["date"] = pd.to_datetime(df["date"])
+
+    history_query = """
+    SELECT
+        fi.fight_id,
+        fi.fighter_1_id,
+        fi.fighter_2_id,
+        fi.winner_id,
+        e.date,
+        f1.dob AS fighter_1_dob,
+        f2.dob AS fighter_2_dob
+    FROM fights fi
+    JOIN events e
+        ON fi.event_id = e.event_id
+    JOIN fighters f1
+        ON fi.fighter_1_id = f1.fighter_id
+    JOIN fighters f2
+        ON fi.fighter_2_id = f2.fighter_id
+    WHERE fi.winner_id IS NOT NULL
+    ORDER BY e.date ASC, fi.fight_id ASC
+    """
+
     history = pd.read_sql(history_query, engine)
-    history['date'] = pd.to_datetime(history['date'])
-    history['winner_dob'] = pd.to_datetime(history['winner_dob'])
-    history['loser_dob'] = pd.to_datetime(history['loser_dob'])
+    history["date"] = pd.to_datetime(history["date"])
+    history["fighter_1_dob"] = pd.to_datetime(
+        history["fighter_1_dob"], errors="coerce"
+    )
+    history["fighter_2_dob"] = pd.to_datetime(
+        history["fighter_2_dob"], errors="coerce"
+    )
 
     fighter_features = compute_fighter_history(history)
-    df = df.merge(fighter_features, on='fight_id', how='left')
 
-    # Flip dataset
-    df_flipped = df.copy()
-    f1_cols = [c for c in df.columns if c.startswith('f1_') or c == 'fighter_1_name']
-    f2_cols = [c for c in df.columns if c.startswith('f2_') or c == 'fighter_2_name']
-    rename_map = {}
-    for c in f1_cols:
-        rename_map[c] = c.replace('f1_', 'f2_').replace('fighter_1_', 'fighter_2_')
-    for c in f2_cols:
-        rename_map[c] = c.replace('f2_', 'f1_').replace('fighter_2_', 'fighter_1_')
-    df_flipped = df_flipped.rename(columns=rename_map)
-    df_flipped['fighter_1_won'] = 0
+    df = df.merge(
+        fighter_features,
+        on="fight_id",
+        how="inner",
+    )
 
-    flipped_mask = df_flipped['fighter_1_won'] == 0
-    hist_f1_cols = ['f1_experience','f1_win_streak','f1_recent_form','f1_days_since_last','f1_age']
-    hist_f2_cols = ['f2_experience','f2_win_streak','f2_recent_form','f2_days_since_last','f2_age']
-    for f1_col, f2_col in zip(hist_f1_cols, hist_f2_cols):
-        df_flipped.loc[flipped_mask, [f1_col, f2_col]] = \
-            df_flipped.loc[flipped_mask, [f2_col, f1_col]].values
+    df["f1_height_in"] = df["f1_height"].apply(height_to_inches)
+    df["f2_height_in"] = df["f2_height"].apply(height_to_inches)
+    df["f1_reach_in"] = df["f1_reach"].apply(reach_to_float)
+    df["f2_reach_in"] = df["f2_reach"].apply(reach_to_float)
 
-    df_balanced = pd.concat([df, df_flipped], ignore_index=True)
+    df["height_diff"] = df["f1_height_in"] - df["f2_height_in"]
+    df["reach_diff"] = df["f1_reach_in"] - df["f2_reach_in"]
+    df["experience_diff"] = df["f1_experience"] - df["f2_experience"]
+    df["win_streak_diff"] = df["f1_win_streak"] - df["f2_win_streak"]
+    df["recent_form_diff"] = (
+        df["f1_recent_form"] - df["f2_recent_form"]
+    )
+    df["days_since_last_diff"] = (
+        df["f1_days_since_last"] - df["f2_days_since_last"]
+    )
+    df["age_diff"] = df["f1_age"] - df["f2_age"]
 
-    # Conversions
-    for prefix in ['f1', 'f2']:
-        df_balanced[f'{prefix}_height_in'] = df_balanced[f'{prefix}_height'].apply(height_to_inches)
-        df_balanced[f'{prefix}_reach_in'] = df_balanced[f'{prefix}_reach'].apply(reach_to_float)
-        df_balanced[f'{prefix}_str_acc_f'] = df_balanced[f'{prefix}_str_acc'].apply(pct_to_float)
-        df_balanced[f'{prefix}_str_def_f'] = df_balanced[f'{prefix}_str_def'].apply(pct_to_float)
-        df_balanced[f'{prefix}_td_acc_f'] = df_balanced[f'{prefix}_td_acc'].apply(pct_to_float)
-        df_balanced[f'{prefix}_td_def_f'] = df_balanced[f'{prefix}_td_def'].apply(pct_to_float)
+    def stance_matchup(stance_1, stance_2):
+        if pd.isna(stance_1) or pd.isna(stance_2):
+            return "unknown"
 
-    # Differentials
-    df_balanced['height_diff'] = df_balanced['f1_height_in'] - df_balanced['f2_height_in']
-    df_balanced['reach_diff'] = df_balanced['f1_reach_in'] - df_balanced['f2_reach_in']
-    df_balanced['slpm_diff'] = df_balanced['f1_slpm'] - df_balanced['f2_slpm']
-    df_balanced['sapm_diff'] = df_balanced['f1_sapm'] - df_balanced['f2_sapm']
-    df_balanced['str_acc_diff'] = df_balanced['f1_str_acc_f'] - df_balanced['f2_str_acc_f']
-    df_balanced['str_def_diff'] = df_balanced['f1_str_def_f'] - df_balanced['f2_str_def_f']
-    df_balanced['td_avg_diff'] = df_balanced['f1_td_avg'] - df_balanced['f2_td_avg']
-    df_balanced['td_acc_diff'] = df_balanced['f1_td_acc_f'] - df_balanced['f2_td_acc_f']
-    df_balanced['td_def_diff'] = df_balanced['f1_td_def_f'] - df_balanced['f2_td_def_f']
-    df_balanced['sub_avg_diff'] = df_balanced['f1_sub_avg'] - df_balanced['f2_sub_avg']
-    df_balanced['experience_diff'] = df_balanced['f1_experience'] - df_balanced['f2_experience']
-    df_balanced['win_streak_diff'] = df_balanced['f1_win_streak'] - df_balanced['f2_win_streak']
-    df_balanced['recent_form_diff'] = df_balanced['f1_recent_form'] - df_balanced['f2_recent_form']
-    df_balanced['days_since_last_diff'] = df_balanced['f1_days_since_last'] - df_balanced['f2_days_since_last']
-    df_balanced['age_diff'] = df_balanced['f1_age'] - df_balanced['f2_age']
-    df_balanced['is_title_fight'] = df_balanced['is_title_fight'].astype(int)
+        stance_1 = stance_1.strip().lower()
+        stance_2 = stance_2.strip().lower()
 
-    # Stance matchup
-    def stance_matchup(s1, s2):
-        if pd.isna(s1) or pd.isna(s2):
-            return 'unknown'
-        s1, s2 = s1.strip().lower(), s2.strip().lower()
-        if s1 == s2: return 'same'
-        if set([s1, s2]) == {'orthodox', 'southpaw'}: return 'ortho_vs_south'
-        return 'other'
+        if stance_1 == stance_2:
+            return "same"
 
-    df_balanced['stance_matchup'] = df_balanced.apply(
-        lambda r: stance_matchup(r['f1_stance'], r['f2_stance']), axis=1)
-    stance_dummies = pd.get_dummies(df_balanced['stance_matchup'], prefix='stance')
-    weight_dummies = pd.get_dummies(df_balanced['weight_class'], prefix='wc')
-    df_balanced = pd.concat([df_balanced, stance_dummies, weight_dummies], axis=1)
+        if {stance_1, stance_2} == {"orthodox", "southpaw"}:
+            return "ortho_vs_south"
 
-    return df_balanced
+        return "other"
+
+    df["stance_matchup"] = df.apply(
+        lambda row: stance_matchup(
+            row["f1_stance"],
+            row["f2_stance"],
+        ),
+        axis=1,
+    )
+
+    stance_dummies = pd.get_dummies(
+        df["stance_matchup"],
+        prefix="stance",
+        dtype=int,
+    )
+    weight_dummies = pd.get_dummies(
+        df["weight_class"],
+        prefix="wc",
+        dtype=int,
+    )
+
+    df = pd.concat(
+        [df, stance_dummies, weight_dummies],
+        axis=1,
+    )
+
+    # Keep the feature schema stable even when a category does not appear
+    # in a particular scrape.
+    for feature in FEATURE_COLS:
+        if feature not in df.columns:
+            df[feature] = 0
+
+    return df.sort_values(["date", "fight_id"]).reset_index(drop=True)
+
+
+def chronological_split(df, test_fraction=0.20):
+    """
+    Reserve the newest portion of event dates for evaluation.
+
+    This more closely reflects the real task: train on past UFC fights and
+    predict fights that occur later.
+    """
+    unique_dates = sorted(df["date"].dropna().unique())
+
+    if len(unique_dates) < 2:
+        raise ValueError("Not enough event dates for a chronological split.")
+
+    split_index = max(
+        1,
+        min(
+            len(unique_dates) - 1,
+            int(len(unique_dates) * (1 - test_fraction)),
+        ),
+    )
+
+    cutoff_date = unique_dates[split_index]
+
+    train_df = df[df["date"] < cutoff_date].copy()
+    test_df = df[df["date"] >= cutoff_date].copy()
+
+    if train_df.empty or test_df.empty:
+        raise ValueError(
+            "Chronological split produced an empty training or test set."
+        )
+
+    return train_df, test_df, pd.Timestamp(cutoff_date)
+
+
+def mirror_training_data(X, y):
+    """
+    Add the opposite fighter ordering for training only.
+
+    A fight A-vs-B becomes B-vs-A, directional differences reverse sign,
+    and the target is inverted. The test set is never duplicated.
+    """
+    mirrored_X = X.copy()
+
+    for feature in DIRECTIONAL_FEATURES:
+        mirrored_X[feature] = -mirrored_X[feature]
+
+    mirrored_y = 1 - y
+
+    augmented_X = pd.concat(
+        [X, mirrored_X],
+        ignore_index=True,
+    )
+    augmented_y = pd.concat(
+        [
+            y.reset_index(drop=True),
+            mirrored_y.reset_index(drop=True),
+        ],
+        ignore_index=True,
+    )
+
+    return augmented_X, augmented_y
+
 
 def train():
     engine = get_engine()
+
     mlflow.set_tracking_uri(MLFLOW_URI)
     mlflow.set_experiment("ufc_fight_prediction")
 
     print("Building dataset...")
     df = build_dataset(engine)
 
-    feature_cols = [
-        'height_diff', 'reach_diff', 'slpm_diff', 'sapm_diff',
-        'str_acc_diff', 'str_def_diff', 'td_avg_diff', 'td_acc_diff',
-        'td_def_diff', 'sub_avg_diff', 'experience_diff', 'win_streak_diff',
-        'recent_form_diff', 'days_since_last_diff', 'age_diff', 'is_title_fight',
-        'stance_same', 'stance_ortho_vs_south', 'stance_other', 'stance_unknown',
-        'wc_Bantamweight', 'wc_Catch Weight', 'wc_Featherweight', 'wc_Flyweight',
-        'wc_Heavyweight', 'wc_Light Heavyweight', 'wc_Lightweight', 'wc_Middleweight',
-        'wc_Open Weight', 'wc_Super Heavyweight', 'wc_Welterweight',
-        "wc_Women's Bantamweight", "wc_Women's Featherweight",
-        "wc_Women's Flyweight", "wc_Women's Strawweight"
-    ]
+    train_df, test_df, cutoff_date = chronological_split(df)
 
-    # Only keep feature cols that exist
-    feature_cols = [f for f in feature_cols if f in df.columns]
-    target_col = 'fighter_1_won'
+    X_train = train_df[FEATURE_COLS].copy()
+    y_train = train_df["fighter_1_won"].astype(int)
 
-    imputer = SimpleImputer(strategy='constant', fill_value=0)
-    X = pd.DataFrame(imputer.fit_transform(df[feature_cols]), columns=feature_cols)
-    y = df[target_col].values
+    X_test = test_df[FEATURE_COLS].copy()
+    y_test = test_df["fighter_1_won"].astype(int)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y)
+    X_train, y_train = mirror_training_data(X_train, y_train)
+
+    # Fit preprocessing only on training data.
+    imputer = SimpleImputer(strategy="constant", fill_value=0)
+
+    X_train = pd.DataFrame(
+        imputer.fit_transform(X_train),
+        columns=FEATURE_COLS,
+    )
+
+    X_test = pd.DataFrame(
+        imputer.transform(X_test),
+        columns=FEATURE_COLS,
+    )
+
+    params = {
+        "n_estimators": 700,
+        "max_depth": 4,
+        "learning_rate": 0.01,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "eval_metric": "logloss",
+        "random_state": 42,
+    }
 
     with mlflow.start_run(run_name="xgboost_weekly_retrain") as run:
-        params = {
-            "model_type": "XGBoost",
-            "n_estimators": 700,
-            "max_depth": 4,
-            "learning_rate": 0.01,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "eval_metric": "logloss",
-            "random_state": 42
-        }
-        mlflow.log_params(params)
+        mlflow.log_params(
+            {
+                "model_type": "XGBoost",
+                **params,
+                "split_strategy": "chronological",
+                "test_cutoff_date": cutoff_date.date().isoformat(),
+                "training_augmentation": "fighter_order_mirroring",
+            }
+        )
 
-        xgb = XGBClassifier(**{k: v for k, v in params.items() if k != "model_type"})
-        xgb.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+        model = XGBClassifier(**params)
+        model.fit(X_train, y_train)
 
-        train_acc = accuracy_score(y_train, xgb.predict(X_train))
-        test_acc = accuracy_score(y_test, xgb.predict(X_test))
-        test_auc = roc_auc_score(y_test, xgb.predict_proba(X_test)[:, 1])
-        test_loss = log_loss(y_test, xgb.predict_proba(X_test))
+        train_probs = model.predict_proba(X_train)[:, 1]
+        test_probs = model.predict_proba(X_test)[:, 1]
 
-        mlflow.log_metric("train_accuracy", train_acc)
-        mlflow.log_metric("test_accuracy", test_acc)
-        mlflow.log_metric("test_auc", test_auc)
-        mlflow.log_metric("test_log_loss", test_loss)
+        train_predictions = (train_probs >= 0.5).astype(int)
+        test_predictions = (test_probs >= 0.5).astype(int)
 
-        mlflow.xgboost.log_model(xgb, "model")
+        train_accuracy = accuracy_score(
+            y_train,
+            train_predictions,
+        )
+        test_accuracy = accuracy_score(
+            y_test,
+            test_predictions,
+        )
+        test_auc = roc_auc_score(
+            y_test,
+            test_probs,
+        )
+        test_log_loss = log_loss(
+            y_test,
+            test_probs,
+        )
 
-        # Register new version
+        mlflow.log_metrics(
+            {
+                "train_accuracy": train_accuracy,
+                "test_accuracy": test_accuracy,
+                "test_auc": test_auc,
+                "test_log_loss": test_log_loss,
+                "train_rows": len(X_train),
+                "test_rows": len(X_test),
+            }
+        )
+
+        signature = infer_signature(
+            X_train,
+            model.predict_proba(X_train),
+        )
+
+        mlflow.xgboost.log_model(
+            model,
+            artifact_path="model",
+            signature=signature,
+        )
+
         model_uri = f"runs:/{run.info.run_id}/model"
-        registered = mlflow.register_model(model_uri, "ufc_fight_predictor")
+
+        registered = mlflow.register_model(
+            model_uri,
+            "ufc_fight_predictor",
+        )
+
         new_version = registered.version
 
-        print(f"Train Accuracy: {train_acc:.4f}")
-        print(f"Test Accuracy:  {test_acc:.4f}")
-        print(f"Test AUC:       {test_auc:.4f}")
-        print(f"Test Log Loss:  {test_loss:.4f}")
+        print(f"Train rows:      {len(X_train)}")
+        print(f"Test rows:       {len(X_test)}")
+        print(f"Test cutoff:     {cutoff_date.date()}")
+        print(f"Train Accuracy:  {train_accuracy:.4f}")
+        print(f"Test Accuracy:   {test_accuracy:.4f}")
+        print(f"Test AUC:        {test_auc:.4f}")
+        print(f"Test Log Loss:   {test_log_loss:.4f}")
         print(f"new_version:{new_version}")
+
 
 if __name__ == "__main__":
     train()
