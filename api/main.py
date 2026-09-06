@@ -717,7 +717,7 @@ def get_accuracy_by_version():
     conn.close()
     return [dict(zip(cols, row)) for row in rows]
 
-# change to get veresions from load_production model 
+# Return metadata for the current production model.
 @app.get("/model/current")
 def get_current_model():
     import mlflow

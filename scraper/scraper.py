@@ -236,7 +236,7 @@ async def run_incremental():
                 print(f"[{i+1}/{len(new_events)}] Scraping: {event['name']}")
                 
                 try:
-                    save_event(conn, event) # no op function, upcoming.py will scrape events and save them
+                    save_event(conn, event)
                     fights = await get_fights(event["url"], browser)
                     for fight in fights:
                         if not fight["fight_id"]:
