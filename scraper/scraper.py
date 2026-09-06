@@ -67,10 +67,9 @@ async def get_events(browser):
    
     return events
 
-# current problem - SELECT split_part(method, E'\n', 1) AS m, count(*)
-#                   FROM fights WHERE winner_id IS NULL
-#                   GROUP BY split_part(method, E'\n', 1) ORDER BY count(*) DESC;
-# gives a table of missing winners, there are 38 missing majority decisions, 17 split, 7 unanimous, needs backfill
+# Some historical decision fights were previously scraped with winner_id=None.
+# Legitimate no-winner outcomes are handled downstream; decision rows with a
+# null winner are treated as data-quality issues and excluded from training.
 async def get_fights(event_url, browser):
     html = await scrape_with_browser(
         event_url,
@@ -100,19 +99,21 @@ async def get_fights(event_url, browser):
         fight_url = flag_link["href"] if flag_link else None
         fight_id = extract_id_from_url(fight_url) if fight_url else None
 
-        # Green flag = fighter 1 won, check text for "win"
-        flag_text = cols[0].select_one("i.b-flag__text")
-        flag_value = flag_text.text.strip() if flag_text else None
+        # Parse the result flags for both fighters and map the winner explicitly.
+        result_flags = [
+            flag.text.strip().lower()
+            for flag in cols[0].select("i.b-flag__text")
+        ]
 
-        if flag_value == "win":
+        fighter_1_result = result_flags[0] if len(result_flags) > 0 else None
+        fighter_2_result = result_flags[1] if len(result_flags) > 1 else None
+
+        if fighter_1_result == "win":
             winner_id = fighter_1_id
+        elif fighter_2_result == "win":
+            winner_id = fighter_2_id
         else:
-            # Check if there's a second flag for fighter 2
-            all_flags = cols[0].select("i.b-flag__text")
-            if len(all_flags) > 1 and all_flags[1].text.strip() == "win":
-                winner_id = fighter_2_id
-            else:
-                winner_id = None
+            winner_id = None
 
         fights.append({
             "fight_id": fight_id,
