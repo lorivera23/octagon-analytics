@@ -3,35 +3,19 @@ services:
     image: postgres:14
     container_name: octagon-postgres
     environment:
-      - POSTGRES_DB=octagon_analytics
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      POSTGRES_DB: octagon_analytics
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     ports:
       - "5432:5432"
-    restart: unless-stopped
-  
-  api:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.api
-    container_name: octagon-api
-    ports:
-      - "8000:8000"
-    environment:
-      - MLFLOW_URI=http://mlflow:5000
-      - DB_NAME=octagon_analytics
-      - DB_USER=mlops
-      - DB_PASSWORD=${DB_PASSWORD}
-      - DB_HOST=postgres
-      - DB_PORT=5432
-    volumes:
-      - ../mlflow/artifacts:/home/mlops/octagon-analytics/mlflow/artifacts
-      - ../scraper:/home/mlops/octagon-analytics/scraper
-    depends_on:
-      - mlflow
-      - postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d octagon_analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     restart: unless-stopped
 
   mlflow:
@@ -42,18 +26,66 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ../mlflow/artifacts:/mlflow/artifacts
+      - mlflow_artifacts:/mlflow/artifacts
     command: >
       mlflow server
-      --backend-store-uri postgresql://mlops:${DB_PASSWORD}@postgres:5432/octagon_analytics
-      --default-artifact-root /mlflow/artifacts
+      --backend-store-uri postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/octagon_analytics
+      --artifacts-destination /mlflow/artifacts
       --host 0.0.0.0
       --port 5000
       --allowed-hosts "mlflow:5000,mlflow,localhost:*,127.0.0.1:*"
       --cors-allowed-origins "*"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: octagon-api
+    ports:
+      - "8000:8000"
+    environment:
+      MLFLOW_URI: http://mlflow:5000
+      DB_NAME: octagon_analytics
+      DB_USER: postgres
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_HOST: postgres
+      DB_PORT: 5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    restart: unless-stopped
+
+  airflow-init:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.airflow
+    container_name: octagon-airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD}@postgres/airflow_db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW_HOME: /opt/airflow
+    command:
+      - bash
+      - -c
+      - >
+        airflow db migrate &&
+        airflow users create
+        --username "${AIRFLOW_ADMIN_USERNAME}"
+        --password "${AIRFLOW_ADMIN_PASSWORD}"
+        --firstname Octagon
+        --lastname Admin
+        --role Admin
+        --email admin@example.com
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   airflow-webserver:
     build:
@@ -64,10 +96,10 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@postgres/airflow_db
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - AIRFLOW_HOME=/opt/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD}@postgres/airflow_db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW_HOME: /opt/airflow
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../airflow/logs:/opt/airflow/logs
@@ -75,7 +107,8 @@ services:
       - ../training:/home/mlops/octagon-analytics/training
       - ../pipeline_utils:/home/mlops/octagon-analytics/pipeline_utils
     depends_on:
-      - postgres
+      airflow-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   airflow-scheduler:
@@ -85,20 +118,23 @@ services:
     container_name: octagon-airflow-scheduler
     command: scheduler
     environment:
-      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@postgres/airflow_db
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - AIRFLOW_HOME=/opt/airflow
-      - DB_NAME=octagon_analytics
-      - DB_USER=mlops
-      - DB_PASSWORD=${DB_PASSWORD}
-      - DB_HOST=postgres
-      - DB_PORT=5432
-      - API_URL=http://api:8000
-      - MLFLOW_URI=http://mlflow:5000
-      - GMAIL_APP_PASSWORD=${GMAIL_APP_PASSWORD}
-      - GMAIL_SENDER=${GMAIL_SENDER}
-      - GMAIL_RECEIVER=${GMAIL_RECEIVER}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD}@postgres/airflow_db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW_HOME: /opt/airflow
+
+      DB_NAME: octagon_analytics
+      DB_USER: postgres
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_HOST: postgres
+      DB_PORT: 5432
+
+      API_URL: http://api:8000
+      MLFLOW_URI: http://mlflow:5000
+
+      GMAIL_APP_PASSWORD: ${GMAIL_APP_PASSWORD}
+      GMAIL_SENDER: ${GMAIL_SENDER}
+      GMAIL_RECEIVER: ${GMAIL_RECEIVER}
     volumes:
       - ../airflow/dags:/opt/airflow/dags
       - ../airflow/logs:/opt/airflow/logs
@@ -106,8 +142,14 @@ services:
       - ../training:/home/mlops/octagon-analytics/training
       - ../pipeline_utils:/home/mlops/octagon-analytics/pipeline_utils
     depends_on:
-      - postgres
+      airflow-init:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+      mlflow:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
   pgdata:
+  mlflow_artifacts:
